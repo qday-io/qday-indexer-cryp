@@ -1,14 +1,13 @@
-# Local run (builds the same image as .github/workflows/build.yml):
+# Pull the image published by .github/workflows/build.yml:
 #   cp .env.example .env
-#   docker compose up --build
+#   docker compose pull && docker compose up
 #
-# Pushes to main/master publish ghcr.io/<owner>/<repo>:latest.
+# Pushes to main/master publish ghcr.io/qday-io/qday-indexer-cryp:latest.
 # Run the workflow manually to set another tag, or push a v* git tag.
 
 services:
   qday-index:
-    build: .
-    image: qday-index:latest
+    image: ghcr.io/qday-io/qday-indexer-cryp:latest
     environment:
       CONFIG: ${CONFIG:-/config/address.txt}
       FROM_BLOCK: ${FROM_BLOCK:-}
