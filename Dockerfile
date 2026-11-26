@@ -15,7 +15,6 @@ RUN apt-get update \
     && mkdir -p /config /data
 COPY --from=builder /qday-index /usr/local/bin/qday-index
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
-COPY address.txt /config/address.txt
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 WORKDIR /data
 ENTRYPOINT ["docker-entrypoint.sh"]
