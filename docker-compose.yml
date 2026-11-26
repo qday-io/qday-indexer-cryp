@@ -1,0 +1,30 @@
+# Local run (builds the same image as .github/workflows/build.yml):
+#   cp .env.example .env
+#   docker compose up --build
+#
+# Pushes to main/master publish ghcr.io/<owner>/<repo>:latest.
+# Run the workflow manually to set another tag, or push a v* git tag.
+
+services:
+  qday-index:
+    build: .
+    image: qday-index:latest
+    environment:
+      CONFIG: ${CONFIG:-/config/address.txt}
+      FROM_BLOCK: ${FROM_BLOCK:-}
+      TO_BLOCK: ${TO_BLOCK:-}
+      BATCH: ${BATCH:-1000}
+      RPC_URL: ${RPC_URL:-}
+      RAW_DIR: ${RAW_DIR:-/data/raw_txs}
+      OUTPUT: ${OUTPUT:-/data/out.csv}
+      CONCURRENCY: ${CONCURRENCY:-8}
+      RPC_BATCH: ${RPC_BATCH:-20}
+      EXCLUDE_SEEDS_FROM_HOP2: ${EXCLUDE_SEEDS_FROM_HOP2:-false}
+      RESUME: ${RESUME:-false}
+    volumes:
+      - ./address.txt:/config/address.txt:ro
+      - ./data:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    init: true
+    restart: "no"

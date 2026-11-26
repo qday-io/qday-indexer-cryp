@@ -1,0 +1,8 @@
+.git
+.github
+target
+data
+raw_txs
+**/*.csv
+.env
+.DS_Store

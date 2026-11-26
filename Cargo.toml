@@ -1,0 +1,21 @@
+[package]
+name = "qday-index"
+version = "0.1.0"
+edition = "2021"
+description = "Extract multi-seed two-hop on-chain transactions from an EVM block range"
+publish = false
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+csv = "1"
+futures = "0.3"
+num-bigint = "0.4"
+num-traits = "0.2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots", "gzip", "http2"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync", "net", "io-util"] }
+
+[dev-dependencies]
+tempfile = "3"
