@@ -9,19 +9,16 @@ services:
   qday-index:
     image: ghcr.io/qday-io/qday-indexer-cryp:latest
     environment:
-      CONFIG: ${CONFIG:-/config/address.txt}
-      FROM_BLOCK: ${FROM_BLOCK:-}
+      FROM_BLOCK: ${FROM_BLOCK:-1}
       TO_BLOCK: ${TO_BLOCK:-}
+      CONFIRM: ${CONFIRM:-0}
       BATCH: ${BATCH:-1000}
       RPC_URL: ${RPC_URL:-}
       RAW_DIR: ${RAW_DIR:-/data/raw_txs}
-      OUTPUT: ${OUTPUT:-/data/out.csv}
       CONCURRENCY: ${CONCURRENCY:-8}
       RPC_BATCH: ${RPC_BATCH:-20}
-      EXCLUDE_SEEDS_FROM_HOP2: ${EXCLUDE_SEEDS_FROM_HOP2:-false}
       RESUME: ${RESUME:-false}
     volumes:
-      - ./address.txt:/config/address.txt:ro
       - ./data:/data
     extra_hosts:
       - "host.docker.internal:host-gateway"

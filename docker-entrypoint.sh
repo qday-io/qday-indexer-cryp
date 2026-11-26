@@ -5,33 +5,29 @@ if [ "$#" -gt 0 ]; then
   exec qday-index "$@"
 fi
 
-: "${FROM_BLOCK:?FROM_BLOCK is required}"
-: "${TO_BLOCK:?TO_BLOCK is required}"
 : "${RPC_URL:?RPC_URL is required}"
 
-config="${CONFIG:-/config/address.txt}"
+from_block="${FROM_BLOCK:-1}"
+confirm="${CONFIRM:-0}"
 batch="${BATCH:-1000}"
 raw_dir="${RAW_DIR:-/data/raw_txs}"
-output="${OUTPUT:-/data/out.csv}"
 concurrency="${CONCURRENCY:-8}"
 rpc_batch="${RPC_BATCH:-20}"
 
-mkdir -p "$raw_dir" "$(dirname "$output")"
+mkdir -p "$raw_dir"
 
 set -- \
   qday-index \
-  --config "$config" \
-  --from-block "$FROM_BLOCK" \
-  --to-block "$TO_BLOCK" \
+  --from-block "$from_block" \
   --batch "$batch" \
   --rpc-url "$RPC_URL" \
   --raw-dir "$raw_dir" \
-  --output "$output" \
   --concurrency "$concurrency" \
-  --rpc-batch "$rpc_batch"
+  --rpc-batch "$rpc_batch" \
+  --confirm "$confirm"
 
-if [ "${EXCLUDE_SEEDS_FROM_HOP2:-false}" = "true" ]; then
-  set -- "$@" --exclude-seeds-from-hop2
+if [ -n "${TO_BLOCK:-}" ]; then
+  set -- "$@" --to-block "$TO_BLOCK"
 fi
 
 if [ "${RESUME:-false}" = "true" ]; then

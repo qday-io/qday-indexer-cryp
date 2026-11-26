@@ -3,7 +3,5 @@
 target
 data
 raw_txs
-**/*.csv
 .env
 .DS_Store
-address.txt

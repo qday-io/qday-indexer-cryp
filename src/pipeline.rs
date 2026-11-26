@@ -2,18 +2,20 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 
+use crate::block::{Block, ParsedBlock};
 use crate::cli::Cli;
-use crate::hop::collect_hops;
-use crate::output::write_csv;
 use crate::rpc::Rpc;
-use crate::seed::load_seeds;
-use crate::store::{count_txs, prepare_raw_dir, write_txs, TxReader};
+use crate::store::{
+    batch_path, block_batch_path, count_jsonl_lines, count_txs, logs_batch_path,
+    prepare_follow_dir, prepare_raw_dir, write_blocks, write_logs, write_txs,
+};
+use crate::tx::Tx;
 
 const MAX_BATCH: u64 = 2_000_000;
 const BATCH_PAUSE_MIN: Duration = Duration::from_secs(2);
 const BATCH_PAUSE_JITTER_MS: u64 = 1_000;
 
-/// Fetch the block range and write Hop 1 / Hop 2 transaction files.
+/// Fetch the block range and write raw transaction files.
 pub async fn run(cli: Cli) -> Result<()> {
     validate(&cli)?;
     if cli.batch > 100_000 {
@@ -23,38 +25,157 @@ pub async fn run(cli: Cli) -> Result<()> {
         );
     }
 
-    let seeds = load_seeds(&cli.config)?;
-    eprintln!(
-        "loaded {} unique seed addresses from {}",
-        seeds.len(),
-        cli.config.display()
-    );
-
-    let chunks = block_chunks(cli.from_block, cli.to_block, cli.batch);
-    let paths = prepare_raw_dir(&cli.raw_dir, &chunks, cli.resume)?;
     let rpc = Rpc::new(cli.rpc_url.trim())?;
+    match cli.to_block {
+        Some(to_block) => run_range(&cli, &rpc, to_block).await,
+        None => run_follow(&cli, &rpc).await,
+    }
+}
+
+async fn run_range(cli: &Cli, rpc: &Rpc, to_block: u64) -> Result<()> {
     let head = rpc.block_number().await?;
     eprintln!("chain head: {head}");
-    if cli.to_block > head {
+    let confirmed = require_confirmed(head, cli.confirm)?;
+    if to_block > confirmed {
+        if cli.confirm == 0 {
+            bail!("--to-block ({to_block}) is greater than chain head {head}");
+        }
         bail!(
-            "--to-block ({}) is greater than chain head {head}",
-            cli.to_block
+            "--to-block ({to_block}) is greater than confirmed head {confirmed} (chain head {head}, --confirm {})",
+            cli.confirm
         );
     }
-    match rpc.chain_id().await {
-        Ok(chain_id) => eprintln!("chain id: {chain_id}"),
-        Err(err) => eprintln!("warning: eth_chainId failed: {err:#}"),
-    }
+    log_chain_id(rpc).await;
 
+    let chunks = block_chunks(cli.from_block, to_block, cli.batch);
+    let paths = prepare_raw_dir(&cli.raw_dir, &chunks, cli.resume)?;
+    let (total_txs, total_blocks, total_logs) = write_chunks(cli, rpc, &chunks, &paths).await?;
+    println!(
+        "Extraction complete | raw txs: {total_txs} | blocks: {total_blocks} | logs: {total_logs}"
+    );
+    println!("raw dir: {}", cli.raw_dir.display());
+    Ok(())
+}
+
+async fn run_follow(cli: &Cli, rpc: &Rpc) -> Result<()> {
+    prepare_follow_dir(&cli.raw_dir, cli.resume)?;
+    log_chain_id(rpc).await;
+    eprintln!(
+        "following from block {}, staying {} blocks behind the chain head",
+        cli.from_block, cli.confirm
+    );
+
+    let mut cursor = cli.from_block;
+    let mut total_txs = 0u64;
+    let mut total_blocks = 0u64;
+    let mut total_logs = 0u64;
     let mut fetched_a_batch = false;
-    for (index, ((start, end), path)) in chunks.iter().zip(&paths).enumerate() {
-        if cli.resume && path.is_file() {
-            let count = count_txs(path)?;
+    let mut seen_head: Option<u64> = None;
+    let mut waiting_for: Option<u64> = None;
+
+    loop {
+        let head = rpc.block_number().await?;
+        if seen_head != Some(head) {
+            eprintln!("chain head: {head}");
+            seen_head = Some(head);
+        }
+        let Some(confirmed) = confirmed_tip(head, cli.confirm) else {
+            if waiting_for != Some(head) {
+                eprintln!(
+                    "chain head {head} is inside the --confirm {} window; waiting",
+                    cli.confirm
+                );
+                waiting_for = Some(head);
+            }
+            tokio::time::sleep(batch_pause()).await;
+            continue;
+        };
+        if cursor > confirmed {
+            if waiting_for != Some(confirmed) {
+                eprintln!(
+                    "confirmed tip {confirmed} (chain head {head}); waiting for block {cursor}"
+                );
+                waiting_for = Some(confirmed);
+            }
+            tokio::time::sleep(batch_pause()).await;
+            continue;
+        }
+        waiting_for = None;
+
+        let end = cursor.saturating_add(cli.batch - 1).min(confirmed);
+        let tx_path = batch_path(&cli.raw_dir, cursor, end);
+        let block_path = block_batch_path(&cli.raw_dir, cursor, end);
+        let logs_path = logs_batch_path(&cli.raw_dir, cursor, end);
+        if cli.resume && tx_path.is_file() && block_path.is_file() && logs_path.is_file() {
+            let count = count_txs(&tx_path)?;
+            total_txs += count;
+            total_blocks += end - cursor + 1;
+            total_logs += count_jsonl_lines(&logs_path)?;
+            eprintln!(
+                "blocks {cursor}-{end}: reused {} ({count} txs, {total_txs} total)",
+                tx_path.display()
+            );
+            cursor = end.saturating_add(1);
+            continue;
+        }
+        if fetched_a_batch {
+            let pause = batch_pause();
+            eprintln!("waiting {:.1}s before the next batch", pause.as_secs_f64());
+            tokio::time::sleep(pause).await;
+        }
+        let started = Instant::now();
+        eprintln!("fetching blocks {cursor}-{end}");
+        let parsed = rpc
+            .fetch_range(cursor, end, cli.concurrency, cli.rpc_batch)
+            .await
+            .with_context(|| format!("fetch blocks {cursor}-{end}"))?;
+        let logs = rpc
+            .fetch_logs(cursor, end, cli.concurrency, cli.rpc_batch)
+            .await
+            .with_context(|| format!("fetch logs {cursor}-{end}"))?;
+        let (blocks, txs) = split_parsed(parsed);
+        write_txs(&tx_path, &txs)?;
+        write_blocks(&block_path, &blocks)?;
+        write_logs(&logs_path, &logs)?;
+        total_txs += u64::try_from(txs.len()).unwrap_or(u64::MAX);
+        total_blocks += u64::try_from(blocks.len()).unwrap_or(u64::MAX);
+        total_logs += u64::try_from(logs.len()).unwrap_or(u64::MAX);
+        eprintln!(
+            "blocks {cursor}-{end}: wrote {} txs, {} blocks, {} logs to {} in {:.1}s ({total_txs} txs, {total_blocks} blocks, {total_logs} logs total)",
+            txs.len(),
+            blocks.len(),
+            logs.len(),
+            tx_path.display(),
+            started.elapsed().as_secs_f64()
+        );
+        fetched_a_batch = true;
+        cursor = end.saturating_add(1);
+    }
+}
+
+async fn write_chunks(
+    cli: &Cli,
+    rpc: &Rpc,
+    chunks: &[(u64, u64)],
+    paths: &[(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)],
+) -> Result<(u64, u64, u64)> {
+    let mut total_txs = 0u64;
+    let mut total_blocks = 0u64;
+    let mut total_logs = 0u64;
+    let mut fetched_a_batch = false;
+    for (index, ((start, end), (tx_path, block_path, logs_path))) in
+        chunks.iter().zip(paths).enumerate()
+    {
+        if cli.resume && tx_path.is_file() && block_path.is_file() && logs_path.is_file() {
+            let count = count_txs(tx_path)?;
+            total_txs += count;
+            total_blocks += end - start + 1;
+            total_logs += count_jsonl_lines(logs_path)?;
             eprintln!(
                 "batch {}/{} blocks {start}-{end}: reused {} ({count} txs)",
                 index + 1,
                 chunks.len(),
-                path.display()
+                tx_path.display()
             );
             continue;
         }
@@ -69,52 +190,71 @@ pub async fn run(cli: Cli) -> Result<()> {
             index + 1,
             chunks.len()
         );
-        let txs = rpc
+        let parsed = rpc
             .fetch_range(*start, *end, cli.concurrency, cli.rpc_batch)
             .await
             .with_context(|| format!("fetch blocks {start}-{end}"))?;
-        write_txs(path, &txs)?;
+        let logs = rpc
+            .fetch_logs(*start, *end, cli.concurrency, cli.rpc_batch)
+            .await
+            .with_context(|| format!("fetch logs {start}-{end}"))?;
+        let (blocks, txs) = split_parsed(parsed);
+        write_txs(tx_path, &txs)?;
+        write_blocks(block_path, &blocks)?;
+        write_logs(logs_path, &logs)?;
+        total_txs += u64::try_from(txs.len()).unwrap_or(u64::MAX);
+        total_blocks += u64::try_from(blocks.len()).unwrap_or(u64::MAX);
+        total_logs += u64::try_from(logs.len()).unwrap_or(u64::MAX);
         eprintln!(
-            "batch {}/{} blocks {start}-{end}: wrote {} txs to {} in {:.1}s",
+            "batch {}/{} blocks {start}-{end}: wrote {} txs, {} blocks, {} logs to {} in {:.1}s",
             index + 1,
             chunks.len(),
             txs.len(),
-            path.display(),
+            blocks.len(),
+            logs.len(),
+            tx_path.display(),
             started.elapsed().as_secs_f64()
         );
         fetched_a_batch = true;
     }
+    Ok((total_txs, total_blocks, total_logs))
+}
 
-    eprintln!("filtering hop 1 and hop 2");
-    let hops = collect_hops(
-        || TxReader::open(&paths),
-        &seeds,
-        cli.from_block,
-        cli.to_block,
-        cli.exclude_seeds_from_hop2,
-    )?;
-    let hop1_count = hops.hop1.len();
-    let hop2_count = hops.hop2.len();
-    let recipients = hops.recipients;
-    let scanned = hops.scanned;
-    let rows = hops.into_rows();
-    write_csv(&cli.output, &rows)?;
+fn split_parsed(parsed: Vec<ParsedBlock>) -> (Vec<Block>, Vec<Tx>) {
+    let mut blocks = Vec::with_capacity(parsed.len());
+    let mut txs = Vec::new();
+    for item in parsed {
+        blocks.push(item.block);
+        txs.extend(item.txs);
+    }
+    (blocks, txs)
+}
 
-    println!(
-        "Extraction complete | Hop 1 txs: {hop1_count} | Unique recipients: {recipients} | Hop 2 txs: {hop2_count}"
-    );
-    println!("scanned raw txs: {scanned}");
-    println!("csv: {}", cli.output.display());
-    Ok(())
+async fn log_chain_id(rpc: &Rpc) {
+    match rpc.chain_id().await {
+        Ok(chain_id) => eprintln!("chain id: {chain_id}"),
+        Err(err) => eprintln!("warning: eth_chainId failed: {err:#}"),
+    }
+}
+
+fn require_confirmed(head: u64, confirm: u64) -> Result<u64> {
+    confirmed_tip(head, confirm).ok_or_else(|| {
+        anyhow::anyhow!("chain head {head} is inside the --confirm {confirm} window")
+    })
+}
+
+fn confirmed_tip(head: u64, confirm: u64) -> Option<u64> {
+    head.checked_sub(confirm)
 }
 
 fn validate(cli: &Cli) -> Result<()> {
-    if cli.from_block > cli.to_block {
-        bail!(
-            "--from-block ({}) is greater than --to-block ({})",
-            cli.from_block,
-            cli.to_block
-        );
+    if let Some(to_block) = cli.to_block {
+        if cli.from_block > to_block {
+            bail!(
+                "--from-block ({}) is greater than --to-block ({to_block})",
+                cli.from_block
+            );
+        }
     }
     if cli.batch == 0 {
         bail!("--batch must be >= 1");
@@ -165,10 +305,10 @@ fn block_chunks(from: u64, to: u64, batch: u64) -> Vec<(u64, u64)> {
 mod tests {
     use super::*;
     use crate::cli::Cli;
-    use crate::hop::collect_hops;
-    use crate::store::{write_txs, TxReader};
+    use crate::logs::Log;
+    use crate::store::TxReader;
     use crate::tx::Tx;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
@@ -191,6 +331,13 @@ mod tests {
     }
 
     #[test]
+    fn confirmation_depth_trims_the_head() {
+        assert_eq!(confirmed_tip(100, 0), Some(100));
+        assert_eq!(confirmed_tip(100, 12), Some(88));
+        assert_eq!(confirmed_tip(5, 12), None);
+    }
+
+    #[test]
     fn splits_inclusive_ranges() {
         assert_eq!(block_chunks(10, 20, 5), vec![(10, 14), (15, 19), (20, 20)]);
         assert_eq!(block_chunks(10, 19, 5), vec![(10, 14), (15, 19)]);
@@ -199,24 +346,6 @@ mod tests {
             block_chunks(u64::MAX - 5, u64::MAX, 10),
             vec![(u64::MAX - 5, u64::MAX)]
         );
-    }
-
-    #[test]
-    fn hop2_spans_batch_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let a = addr(0x11);
-        let c = addr(0x22);
-        let d = addr(0x33);
-        let first = dir.path().join("batch_1_1.jsonl");
-        let second = dir.path().join("batch_2_2.jsonl");
-        write_txs(&first, &[Tx::sample(1, 0, &a, Some(&c))]).unwrap();
-        write_txs(&second, &[Tx::sample(2, 0, &c, Some(&d))]).unwrap();
-        let paths = vec![first, second];
-        let seeds = HashSet::from([a]);
-        let out = collect_hops(|| TxReader::open(&paths), &seeds, 1, 2, false).unwrap();
-        assert_eq!(out.hop1.len(), 1);
-        assert_eq!(out.hop2.len(), 1);
-        assert_eq!(out.recipients, 1);
     }
 
     #[tokio::test]
@@ -247,22 +376,22 @@ mod tests {
             ),
         ]);
         let hits = Arc::new(AtomicUsize::new(0));
-        let addr = serve(blocks, Arc::clone(&hits)).await;
+        let logs = HashMap::from([
+            (1, vec![rpc_log(1, 1, 0, &c)]),
+            (2, vec![rpc_log(2, 0, 0, &d), rpc_log(2, 0, 1, &d)]),
+        ]);
+        let addr = serve_with_logs(blocks, logs, Arc::clone(&hits)).await;
 
         let dir = tempfile::tempdir().unwrap();
-        let config = dir.path().join("seeds.txt");
-        std::fs::write(&config, a.to_uppercase()).unwrap();
         let cli = Cli {
-            config,
             from_block: 1,
-            to_block: 2,
+            to_block: Some(2),
+            confirm: 0,
             batch: 1,
             rpc_url: format!("http://{addr}"),
             raw_dir: dir.path().join("raw"),
-            output: dir.path().join("out.csv"),
             concurrency: 2,
             rpc_batch: 1,
-            exclude_seeds_from_hop2: false,
             resume: false,
         };
 
@@ -271,31 +400,41 @@ mod tests {
             .expect("pipeline timed out")
             .unwrap();
 
-        let csv_path = dir.path().join("out.csv");
-        let mut reader = csv::Reader::from_path(&csv_path).unwrap();
-        let rows: Vec<(String, u64, u64, String)> = reader
-            .records()
-            .map(|record| {
-                let record = record.unwrap();
-                (
-                    record.get(0).unwrap().to_string(),
-                    record.get(1).unwrap().parse().unwrap(),
-                    record.get(2).unwrap().parse().unwrap(),
-                    record.get(4).unwrap().to_string(),
-                )
-            })
-            .collect();
+        let raw = dir.path().join("raw");
+        let batch1 = read_txs(&raw.join("batch_1_1.jsonl"));
+        let batch2 = read_txs(&raw.join("batch_2_2.jsonl"));
         assert_eq!(
-            rows,
-            vec![
-                ("hop1".to_string(), 1, 1, a.clone()),
-                ("hop2".to_string(), 1, 2, c.clone()),
-                ("hop2".to_string(), 2, 0, c),
-            ]
+            batch1
+                .iter()
+                .map(|tx| (tx.transaction_index, tx.from_address.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(0, c.as_str()), (1, a.as_str()), (2, c.as_str())]
         );
-        assert!(dir.path().join("raw").join("batch_1_1.jsonl").is_file());
-        assert!(dir.path().join("raw").join("batch_2_2.jsonl").is_file());
-        assert!(!dir.path().join("out.parquet").exists());
+        assert_eq!(
+            batch2
+                .iter()
+                .map(|tx| (tx.transaction_index, tx.from_address.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(0, c.as_str()), (1, other.as_str())]
+        );
+        let blocks1 = read_blocks(&raw.join("blocks_1_1.jsonl"));
+        let blocks2 = read_blocks(&raw.join("blocks_2_2.jsonl"));
+        assert_eq!(blocks1.len(), 1);
+        assert_eq!(blocks1[0].block_number, 1);
+        assert_eq!(blocks1[0].transaction_count, 3);
+        assert_eq!(blocks2.len(), 1);
+        assert_eq!(blocks2[0].block_number, 2);
+        assert_eq!(blocks2[0].transaction_count, 2);
+        let logs1 = read_logs(&raw.join("logs_1_1.jsonl"));
+        let logs2 = read_logs(&raw.join("logs_2_2.jsonl"));
+        assert_eq!(logs1.len(), 1);
+        assert_eq!(logs1[0].block_number, 1);
+        assert_eq!(logs1[0].transaction_index, 1);
+        assert_eq!(logs1[0].address, c);
+        assert_eq!(logs2.len(), 2);
+        assert_eq!(logs2[0].log_index, 0);
+        assert_eq!(logs2[1].log_index, 1);
+        assert_eq!(logs2[1].address, d);
 
         let after_first = hits.load(Ordering::Relaxed);
         assert!(
@@ -304,16 +443,14 @@ mod tests {
         );
 
         let cli = Cli {
-            config: dir.path().join("seeds.txt"),
             from_block: 1,
-            to_block: 2,
+            to_block: Some(2),
+            confirm: 0,
             batch: 1,
             rpc_url: format!("http://{addr}"),
             raw_dir: dir.path().join("raw"),
-            output: dir.path().join("out.csv"),
             concurrency: 2,
             rpc_batch: 1,
-            exclude_seeds_from_hop2: false,
             resume: true,
         };
         tokio::time::timeout(Duration::from_secs(30), run(cli))
@@ -324,10 +461,133 @@ mod tests {
         assert_eq!(extra, 2, "resume should only query head and chain id");
     }
 
+    #[tokio::test]
+    async fn follow_stays_behind_the_chain_head() {
+        let blocks = HashMap::from([
+            (1, block(1, vec![rpc_tx(1, 0, &addr(0x11), Some(&addr(0x22)))])),
+            (2, block(2, vec![rpc_tx(2, 0, &addr(0x22), Some(&addr(0x33)))])),
+        ]);
+        let hits = Arc::new(AtomicUsize::new(0));
+        let addr = serve(blocks, Arc::clone(&hits)).await;
+        let dir = tempfile::tempdir().unwrap();
+        let raw = dir.path().join("raw");
+        let cli = Cli {
+            from_block: 1,
+            to_block: None,
+            confirm: 1,
+            batch: 1,
+            rpc_url: format!("http://{addr}"),
+            raw_dir: raw.clone(),
+            concurrency: 1,
+            rpc_batch: 1,
+            resume: false,
+        };
+        let task = tokio::spawn(async move { run(cli).await });
+        let logs1_path = raw.join("logs_1_1.jsonl");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while !logs1_path.is_file() {
+            if task.is_finished() {
+                panic!("follow exited early: {:?}", task.await);
+            }
+            if tokio::time::Instant::now() > deadline {
+                panic!("timed out waiting for the confirmed block");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(read_txs(&raw.join("batch_1_1.jsonl")).len(), 1);
+        let blocks1 = read_blocks(&raw.join("blocks_1_1.jsonl"));
+        assert_eq!(blocks1.len(), 1);
+        assert_eq!(blocks1[0].block_number, 1);
+        assert_eq!(read_logs(&logs1_path).len(), 0);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !raw.join("batch_2_2.jsonl").exists(),
+            "block 2 is the chain head and --confirm 1 must leave it unindexed"
+        );
+        assert!(!raw.join("blocks_2_2.jsonl").exists());
+        assert!(!raw.join("logs_2_2.jsonl").exists());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn bounded_range_rejects_unconfirmed_tip() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let addr = serve(HashMap::new(), hits).await;
+        let dir = tempfile::tempdir().unwrap();
+        let err = run(Cli {
+            from_block: 1,
+            to_block: Some(2),
+            confirm: 1,
+            batch: 1,
+            rpc_url: format!("http://{addr}"),
+            raw_dir: dir.path().join("raw"),
+            concurrency: 1,
+            rpc_batch: 1,
+            resume: false,
+        })
+        .await
+        .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("confirmed head 1"),
+            "unexpected error: {message}"
+        );
+    }
+
+    fn read_txs(path: &std::path::Path) -> Vec<Tx> {
+        TxReader::open(&[path.to_path_buf()])
+            .unwrap()
+            .map(|item| item.unwrap())
+            .collect()
+    }
+
+    fn read_blocks(path: &std::path::Path) -> Vec<Block> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    fn read_logs(path: &std::path::Path) -> Vec<Log> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    fn rpc_log(block_number: u64, tx_index: u64, log_index: u64, address: &str) -> Value {
+        json!({
+            "address": address,
+            "topics": [format!("0x{:064x}", block_number * 10 + log_index)],
+            "data": "0x",
+            "blockNumber": format!("0x{block_number:x}"),
+            "transactionHash": format!("0x{:064x}", block_number * 100 + tx_index + 1),
+            "transactionIndex": format!("0x{tx_index:x}"),
+            "blockHash": format!("0x{:064x}", block_number + 1),
+            "logIndex": format!("0x{log_index:x}"),
+            "removed": false,
+        })
+    }
+
     fn block(number: u64, txs: Vec<Value>) -> Value {
         json!({
             "number": format!("0x{number:x}"),
             "hash": format!("0x{:064x}", number + 1),
+            "parentHash": format!("0x{:064x}", number),
+            "timestamp": format!("0x{number:x}"),
+            "miner": addr(0x99),
+            "gasUsed": "0x5208",
+            "gasLimit": "0x100000",
+            "difficulty": "0x0",
+            "size": "0x200",
+            "stateRoot": format!("0x{:064x}", number + 2),
+            "transactionsRoot": format!("0x{:064x}", number + 3),
+            "receiptsRoot": format!("0x{:064x}", number + 4),
+            "extraData": "0x",
             "transactions": txs,
         })
     }
@@ -350,18 +610,28 @@ mod tests {
     }
 
     async fn serve(blocks: HashMap<u64, Value>, hits: Arc<AtomicUsize>) -> std::net::SocketAddr {
+        serve_with_logs(blocks, HashMap::new(), hits).await
+    }
+
+    async fn serve_with_logs(
+        blocks: HashMap<u64, Value>,
+        logs: HashMap<u64, Vec<Value>>,
+        hits: Arc<AtomicUsize>,
+    ) -> std::net::SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let blocks = Arc::new(blocks);
+        let logs = Arc::new(logs);
         tokio::spawn(async move {
             loop {
                 let Ok((socket, _)) = listener.accept().await else {
                     break;
                 };
                 let blocks = Arc::clone(&blocks);
+                let logs = Arc::clone(&logs);
                 let hits = Arc::clone(&hits);
                 tokio::spawn(async move {
-                    let _ = handle_conn(socket, blocks, hits).await;
+                    let _ = handle_conn(socket, blocks, logs, hits).await;
                 });
             }
         });
@@ -371,10 +641,11 @@ mod tests {
     async fn handle_conn(
         mut socket: TcpStream,
         blocks: Arc<HashMap<u64, Value>>,
+        logs: Arc<HashMap<u64, Vec<Value>>>,
         hits: Arc<AtomicUsize>,
     ) -> Result<()> {
         let body = read_http_body(&mut socket).await?;
-        let response = dispatch(&body, &blocks, &hits);
+        let response = dispatch(&body, &blocks, &logs, &hits);
         let header = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             response.len()
@@ -433,7 +704,12 @@ mod tests {
             .unwrap_or(0)
     }
 
-    fn dispatch(body: &str, blocks: &HashMap<u64, Value>, hits: &AtomicUsize) -> String {
+    fn dispatch(
+        body: &str,
+        blocks: &HashMap<u64, Value>,
+        logs: &HashMap<u64, Vec<Value>>,
+        hits: &AtomicUsize,
+    ) -> String {
         hits.fetch_add(1, Ordering::Relaxed);
         let value: Value = match serde_json::from_str(body) {
             Ok(value) => value,
@@ -449,30 +725,51 @@ mod tests {
         if let Some(items) = value.as_array() {
             let out: Vec<Value> = items
                 .iter()
-                .map(|item| dispatch_one(item, blocks))
+                .map(|item| dispatch_one(item, blocks, logs))
                 .collect();
             Value::Array(out).to_string()
         } else {
-            dispatch_one(&value, blocks).to_string()
+            dispatch_one(&value, blocks, logs).to_string()
         }
     }
 
-    fn dispatch_one(item: &Value, blocks: &HashMap<u64, Value>) -> Value {
+    fn dispatch_one(
+        item: &Value,
+        blocks: &HashMap<u64, Value>,
+        logs: &HashMap<u64, Vec<Value>>,
+    ) -> Value {
         let id = item.get("id").cloned().unwrap_or_else(|| json!(1));
         let method = item.get("method").and_then(Value::as_str).unwrap_or("");
         let result = match method {
             "eth_blockNumber" => json!("0x2"),
             "eth_chainId" => json!("0x1"),
             "eth_getBlockByNumber" => {
-                let hex = item
+                let number = hex_param(item, 0);
+                blocks.get(&number).cloned().unwrap_or(Value::Null)
+            }
+            "eth_getLogs" => {
+                let filter = item
                     .get("params")
                     .and_then(Value::as_array)
                     .and_then(|params| params.first())
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
+                let from = filter
+                    .get("fromBlock")
                     .and_then(Value::as_str)
-                    .unwrap_or("0x0");
-                let digits = hex.trim_start_matches("0x");
-                let number = u64::from_str_radix(digits, 16).unwrap_or(0);
-                blocks.get(&number).cloned().unwrap_or(Value::Null)
+                    .map(parse_hex)
+                    .unwrap_or(0);
+                let to = filter
+                    .get("toBlock")
+                    .and_then(Value::as_str)
+                    .map(parse_hex)
+                    .unwrap_or(u64::MAX);
+                Value::Array(
+                    logs.iter()
+                        .filter(|(block, _)| **block >= from && **block <= to)
+                        .flat_map(|(_, entries)| entries.clone())
+                        .collect(),
+                )
             }
             _ => {
                 return json!({
@@ -483,5 +780,18 @@ mod tests {
             }
         };
         json!({"jsonrpc": "2.0", "id": id, "result": result})
+    }
+
+    fn hex_param(item: &Value, index: usize) -> u64 {
+        item.get("params")
+            .and_then(Value::as_array)
+            .and_then(|params| params.get(index))
+            .and_then(Value::as_str)
+            .map(parse_hex)
+            .unwrap_or(0)
+    }
+
+    fn parse_hex(hex: &str) -> u64 {
+        u64::from_str_radix(hex.trim_start_matches("0x"), 16).unwrap_or(0)
     }
 }

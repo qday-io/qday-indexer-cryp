@@ -5,20 +5,63 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
+use crate::block::Block;
+use crate::logs::Log;
 use crate::tx::Tx;
 
 pub fn batch_path(dir: &Path, start: u64, end: u64) -> PathBuf {
     dir.join(format!("batch_{start}_{end}.jsonl"))
 }
 
-pub fn prepare_raw_dir(dir: &Path, chunks: &[(u64, u64)], resume: bool) -> Result<Vec<PathBuf>> {
+pub fn block_batch_path(dir: &Path, start: u64, end: u64) -> PathBuf {
+    dir.join(format!("blocks_{start}_{end}.jsonl"))
+}
+
+pub fn logs_batch_path(dir: &Path, start: u64, end: u64) -> PathBuf {
+    dir.join(format!("logs_{start}_{end}.jsonl"))
+}
+
+fn is_managed_batch_file(name: &str) -> bool {
+    (name.starts_with("batch_") || name.starts_with("blocks_") || name.starts_with("logs_"))
+        && (name.ends_with(".jsonl") || name.ends_with(".jsonl.tmp"))
+}
+
+pub fn prepare_follow_dir(dir: &Path, resume: bool) -> Result<()> {
     fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-    let paths: Vec<PathBuf> = chunks
+    for entry in fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !is_managed_batch_file(&name) {
+            continue;
+        }
+        if name.ends_with(".jsonl.tmp") || !resume {
+            fs::remove_file(entry.path())
+                .with_context(|| format!("remove {}", entry.path().display()))?;
+        }
+    }
+    Ok(())
+}
+
+pub fn prepare_raw_dir(
+    dir: &Path,
+    chunks: &[(u64, u64)],
+    resume: bool,
+) -> Result<Vec<(PathBuf, PathBuf, PathBuf)>> {
+    fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    let paths: Vec<(PathBuf, PathBuf, PathBuf)> = chunks
         .iter()
-        .map(|(start, end)| batch_path(dir, *start, *end))
+        .map(|(start, end)| {
+            (
+                batch_path(dir, *start, *end),
+                block_batch_path(dir, *start, *end),
+                logs_batch_path(dir, *start, *end),
+            )
+        })
         .collect();
     let expected: HashSet<String> = paths
         .iter()
+        .flat_map(|(tx_path, block_path, logs_path)| [tx_path, block_path, logs_path])
         .filter_map(|path| {
             path.file_name()
                 .map(|name| name.to_string_lossy().into_owned())
@@ -29,9 +72,7 @@ pub fn prepare_raw_dir(dir: &Path, chunks: &[(u64, u64)], resume: bool) -> Resul
         let entry = entry?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        let managed = name.starts_with("batch_")
-            && (name.ends_with(".jsonl") || name.ends_with(".jsonl.tmp"));
-        if !managed {
+        if !is_managed_batch_file(&name) {
             continue;
         }
         let unexpected = !expected.contains(name.as_ref());
@@ -58,8 +99,24 @@ pub fn write_txs(path: &Path, txs: &[Tx]) -> Result<()> {
                 right.transaction_hash.as_str(),
             ))
     });
+    write_atomic(path, &order)
+}
+
+pub fn write_blocks(path: &Path, blocks: &[Block]) -> Result<()> {
+    let mut order: Vec<&Block> = blocks.iter().collect();
+    order.sort_by_key(|block| block.block_number);
+    write_atomic(path, &order)
+}
+
+pub fn write_logs(path: &Path, logs: &[Log]) -> Result<()> {
+    let mut order: Vec<&Log> = logs.iter().collect();
+    order.sort_by_key(|log| (log.block_number, log.transaction_index, log.log_index));
+    write_atomic(path, &order)
+}
+
+fn write_atomic<T: serde::Serialize>(path: &Path, items: &[&T]) -> Result<()> {
     let tmp = tmp_path(path);
-    let write_result = write_jsonl(&tmp, &order);
+    let write_result = write_jsonl(&tmp, items);
     if write_result.is_err() {
         let _ = fs::remove_file(&tmp);
     }
@@ -77,6 +134,18 @@ pub fn count_txs(path: &Path) -> Result<u64> {
     for item in reader {
         item?;
         count += 1;
+    }
+    Ok(count)
+}
+
+pub fn count_jsonl_lines(path: &Path) -> Result<u64> {
+    let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut count = 0u64;
+    for line in BufReader::new(file).lines() {
+        let line = line.with_context(|| format!("read {}", path.display()))?;
+        if !line.trim().is_empty() {
+            count += 1;
+        }
     }
     Ok(count)
 }
@@ -159,11 +228,11 @@ impl Iterator for TxReader {
     }
 }
 
-fn write_jsonl(path: &Path, txs: &[&Tx]) -> Result<()> {
+fn write_jsonl<T: serde::Serialize>(path: &Path, items: &[&T]) -> Result<()> {
     let file = File::create(path)?;
     let mut writer = BufWriter::new(file);
-    for tx in txs {
-        serde_json::to_writer(&mut writer, tx)?;
+    for item in items {
+        serde_json::to_writer(&mut writer, item)?;
         writer.write_all(b"\n")?;
     }
     writer.flush()?;
@@ -180,6 +249,8 @@ fn tmp_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::block::Block;
+    use crate::logs::Log;
     use crate::tx::Tx;
 
     fn addr(byte: u8) -> String {
@@ -202,19 +273,102 @@ mod tests {
     }
 
     #[test]
+    fn block_jsonl_roundtrip_preserves_optional_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blocks_1_1.jsonl");
+        let mut block = Block::sample(1);
+        block.base_fee_per_gas = None;
+        block.withdrawals_root = None;
+        write_blocks(&path, &[block.clone()]).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        let loaded: Vec<Block> = text
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(loaded, vec![block]);
+    }
+
+    #[test]
+    fn logs_jsonl_roundtrip_preserves_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("logs_1_1.jsonl");
+        let first = Log::sample(1, 0, 1);
+        let second = Log::sample(1, 0, 0);
+        write_logs(&path, &[first.clone(), second]).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        let loaded: Vec<Log> = text
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(loaded, vec![Log::sample(1, 0, 0), first]);
+    }
+
+    #[test]
     fn prepare_keeps_only_expected_resume_files() {
         let dir = tempfile::tempdir().unwrap();
-        let stale = batch_path(dir.path(), 9, 9);
-        let kept = batch_path(dir.path(), 5, 6);
+        let stale_tx = batch_path(dir.path(), 9, 9);
+        let kept_tx = batch_path(dir.path(), 5, 6);
+        let stale_blocks = block_batch_path(dir.path(), 9, 9);
+        let kept_blocks = block_batch_path(dir.path(), 5, 6);
+        let stale_logs = logs_batch_path(dir.path(), 9, 9);
+        let kept_logs = logs_batch_path(dir.path(), 5, 6);
         fs::create_dir_all(dir.path()).unwrap();
-        fs::write(&stale, "{}\n").unwrap();
-        fs::write(&kept, "{}\n").unwrap();
+        for path in [
+            &stale_tx,
+            &kept_tx,
+            &stale_blocks,
+            &kept_blocks,
+            &stale_logs,
+            &kept_logs,
+        ] {
+            fs::write(path, "{}\n").unwrap();
+        }
 
-        prepare_raw_dir(dir.path(), &[(5, 6)], true).unwrap();
-        assert!(kept.exists());
-        assert!(!stale.exists());
+        let paths = prepare_raw_dir(dir.path(), &[(5, 6)], true).unwrap();
+        assert_eq!(
+            paths,
+            vec![(kept_tx.clone(), kept_blocks.clone(), kept_logs.clone())]
+        );
+        assert!(kept_tx.exists());
+        assert!(kept_blocks.exists());
+        assert!(kept_logs.exists());
+        assert!(!stale_tx.exists());
+        assert!(!stale_blocks.exists());
+        assert!(!stale_logs.exists());
 
         prepare_raw_dir(dir.path(), &[(5, 6)], false).unwrap();
-        assert!(!kept.exists());
+        assert!(!kept_tx.exists());
+        assert!(!kept_blocks.exists());
+        assert!(!kept_logs.exists());
+    }
+
+    #[test]
+    fn follow_dir_keeps_batches_only_when_resuming() {
+        let dir = tempfile::tempdir().unwrap();
+        let kept_tx = batch_path(dir.path(), 1, 2);
+        let kept_blocks = block_batch_path(dir.path(), 1, 2);
+        let kept_logs = logs_batch_path(dir.path(), 1, 2);
+        fs::create_dir_all(dir.path()).unwrap();
+        fs::write(&kept_tx, "{}\n").unwrap();
+        fs::write(&kept_blocks, "{}\n").unwrap();
+        fs::write(&kept_logs, "{}\n").unwrap();
+        fs::write(dir.path().join("batch_3_4.jsonl.tmp"), "").unwrap();
+        fs::write(dir.path().join("blocks_3_4.jsonl.tmp"), "").unwrap();
+        fs::write(dir.path().join("logs_3_4.jsonl.tmp"), "").unwrap();
+
+        prepare_follow_dir(dir.path(), true).unwrap();
+        assert!(kept_tx.exists());
+        assert!(kept_blocks.exists());
+        assert!(kept_logs.exists());
+        assert!(!dir.path().join("batch_3_4.jsonl.tmp").exists());
+        assert!(!dir.path().join("blocks_3_4.jsonl.tmp").exists());
+        assert!(!dir.path().join("logs_3_4.jsonl.tmp").exists());
+
+        prepare_follow_dir(dir.path(), false).unwrap();
+        assert!(!kept_tx.exists());
+        assert!(!kept_blocks.exists());
+        assert!(!kept_logs.exists());
     }
 }
